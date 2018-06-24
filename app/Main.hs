@@ -22,6 +22,7 @@ import Data.List (sortOn)
 import Data.Text.Encoding.Error (strictDecode)
 import Data.Time.LocalTime (ZonedTime(..))
 import qualified FortyTwo
+import qualified FortyTwo.Utils as FortyTwo
 import Network.HTTP.Client
   ( HttpException(..)
   , HttpExceptionContent(..)
@@ -40,7 +41,7 @@ makePrisms ''HttpExceptionContent
 
 data HostExtractionException =
   HostExtractionException Text
-  deriving (Show)
+  deriving Show
 
 instance Exception HostExtractionException
 
@@ -75,7 +76,7 @@ data Commit = Commit
   , _commitCommitterName :: Text
   , _commitCommitterEmail :: Text
   , _commitCommittedDate :: ZonedTime
-  } deriving (Show)
+  } deriving Show
 
 makeLenses ''Commit
 
@@ -93,7 +94,7 @@ data Branch = Branch
   , _branchProtected :: Bool
   , _branchDevelopersCanPush :: Bool
   , _branchDevelopersCanMerge :: Bool
-  } deriving (Show)
+  } deriving Show
 
 makeLenses ''Branch
 
@@ -113,7 +114,7 @@ data MergeReq = MergeReq
   , _mrTitle :: Text
   , _mrState :: Text
   , _mrWebUrl :: Text
-  }
+  } deriving Show
 
 makeLenses ''MergeReq
 
@@ -155,7 +156,7 @@ createMrBody title source target =
 main :: IO ()
 main = do
   Options token isVerbose <- OA.execParser opts
-  logOptions' <- logOptionsHandle stderr isVerbose
+  logOptions' <- logOptionsHandle stdout isVerbose
   let logOptions = setLogUseTime True logOptions'
   withLogFunc logOptions $ \lf -> do
     let app = Env token lf
@@ -218,10 +219,10 @@ createMergeRequest source target = do
     else do
       doIt <-
         liftIO $
-        FortyTwo.confirmWithDefault
-          ("Create merge request from " ++
-           T.unpack source ++ " into " ++ T.unpack target ++ "?")
-          True
+          FortyTwo.confirmWithDefault
+            ("Create merge request from " ++
+             T.unpack source ++ " into " ++ T.unpack target ++ "?")
+            True
       when doIt $ do
         title <-
           liftIO $
@@ -230,6 +231,7 @@ createMergeRequest source target = do
             ("Merge branch " ++ T.unpack source)
         result <-
           try $ do
+            liftIO FortyTwo.flush
             token <- view envAccessToken
             response <-
               liftIO $
@@ -241,7 +243,10 @@ createMergeRequest source target = do
                 (createMrBody (T.pack title) source target)
             return (preview (Wreq.responseBody . AesonLens._JSON) response)
         case result of
-          Right resp -> logInfo . display $ view (traverse . mrWebUrl) resp
+          Right (Just mr) -> do
+            logInfo . display $ view mrWebUrl mr
+            logInfo "Created the merge request"
+          Right Nothing -> logError . displayShow $ result
           Left e -> handleHttpException e
 
 getBranches ::

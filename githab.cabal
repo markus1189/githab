@@ -34,10 +34,12 @@ executable githab
                , aeson
                , bytestring
                , cases
+               , connection
                , containers
                , formatting
                , fortytwo
                , http-client
+               , http-client-tls
                , http-types
                , lens
                , lens-aeson

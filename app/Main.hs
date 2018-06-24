@@ -3,9 +3,9 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE PartialTypeSignatures #-}
-
 module Main where
 
+import           Network.Connection (TLSSettings(..))
 import Cases (snakify)
 import Control.Applicative ((<**>))
 import Control.Exception (throw)
@@ -23,13 +23,17 @@ import Data.Text.Encoding.Error (strictDecode)
 import Data.Time.LocalTime (ZonedTime(..))
 import qualified FortyTwo
 import qualified FortyTwo.Utils as FortyTwo
+import Network.HTTP.Client.TLS (mkManagerSettings)
 import Network.HTTP.Client
   ( HttpException(..)
   , HttpExceptionContent(..)
   , Response(..)
+  , ManagerSettings
+  , defaultManagerSettings
   )
 import Network.HTTP.Types (urlEncode)
 import qualified Network.Wreq as Wreq
+import qualified Network.Wreq.Session as WreqS
 import qualified Options.Applicative as OA
 import RIO
 import qualified RIO.Text as T
@@ -48,6 +52,7 @@ instance Exception HostExtractionException
 data Options = Options
   { _optionsToken :: String
   , _optionsVerbose :: Bool
+  , _optionsNoVerify :: Bool
   }
 
 options :: OA.Parser Options
@@ -56,7 +61,9 @@ options =
   OA.strOption
     (OA.long "token" <> OA.metavar "TOKEN" <> OA.help "Access token for gitlab") <*>
   OA.switch
-    (OA.long "verbose" <> OA.short 'v' <> OA.help "Enable verbose logging")
+    (OA.long "verbose" <> OA.short 'v' <> OA.help "Enable verbose logging") <*>
+  OA.switch
+    (OA.long "no-verify" <> OA.help "Disable certificate check (on your own risk)")
 
 opts :: OA.ParserInfo Options
 opts =
@@ -128,6 +135,7 @@ $(deriveJSON
 data Env = Env
   { _envAccessToken :: String
   , _envLogFunc :: LogFunc
+  , _envSession :: WreqS.Session
   }
 
 makeClassy ''Env
@@ -155,12 +163,14 @@ createMrBody title source target =
 
 main :: IO ()
 main = do
-  Options token isVerbose <- OA.execParser opts
-  logOptions' <- logOptionsHandle stdout isVerbose
+  Options token isVerbose noVerify <- OA.execParser opts
+  session <- WreqS.newSessionControl Nothing (if noVerify then noVerifyTlsManagerSettings else defaultManagerSettings)
+  logOptions' <- logOptionsHandle stderr isVerbose
   let logOptions = setLogUseTime True logOptions'
   withLogFunc logOptions $ \lf -> do
-    let app = Env token lf
+    let app = Env token lf session
     runRIO app $ do
+      when noVerify $ logDebug "Certificate checking is disabled!"
       eitherBranches <- fmap (toListOf (traverse . branchName)) <$> getBranches
       case eitherBranches of
         Left e -> handleHttpException e
@@ -213,6 +223,7 @@ createMergeRequest ::
   -> Text
   -> m ()
 createMergeRequest source target = do
+  sess <- view envSession
   (T.unpack -> host, T.unpack -> project) <- getHostAndProject
   if source == target
     then logError "Source and target branches are equal, refusing."
@@ -235,7 +246,7 @@ createMergeRequest source target = do
             token <- view envAccessToken
             response <-
               liftIO $
-              Wreq.post
+              WreqS.post sess
                 ("https://" ++
                  host ++
                  "/api/v4" ++
@@ -254,12 +265,13 @@ getBranches ::
   => m (Either HttpException [Branch])
 getBranches =
   try $ do
+    sess <- view envSession
     token <- view envAccessToken
     (T.unpack -> host, T.unpack -> project) <- getHostAndProject
     resp <-
       view Wreq.responseBody <$>
       liftIO
-        (Wreq.get
+        (WreqS.get sess
            ("https://" ++
             host ++
             "/api/v4" ++
@@ -296,3 +308,13 @@ handleHttpException (HttpExceptionRequest _ (ConnectionFailure e)) = do
   logError "Oops something went wrong!"
   logError . display $ e
 handleHttpException e = throw e
+
+noVerifyTlsSettings :: TLSSettings
+noVerifyTlsSettings = TLSSettingsSimple
+  { settingDisableCertificateValidation = True
+  , settingDisableSession = True
+  , settingUseServerName = False
+  }
+
+noVerifyTlsManagerSettings :: ManagerSettings
+noVerifyTlsManagerSettings = mkManagerSettings noVerifyTlsSettings Nothing

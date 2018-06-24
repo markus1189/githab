@@ -6,27 +6,31 @@
 
 module Main where
 
-import           Cases (snakify)
-import           Control.Applicative ((<**>))
-import           Control.Exception (throw)
-import           Control.Lens ((^..), preview, toListOf)
-import           Control.Lens.TH (makeClassy, makeLenses, makePrisms)
-import           Control.Monad (when)
-import           Control.Monad.IO.Class (liftIO)
-import           Data.Aeson (Value)
+import Cases (snakify)
+import Control.Applicative ((<**>))
+import Control.Exception (throw)
+import Control.Lens (preview, toListOf)
+import Control.Lens.TH (makeClassy, makeLenses, makePrisms)
+import Control.Monad (when)
+import Control.Monad.IO.Class (liftIO)
+import Data.Aeson (Value)
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Lens as AesonLens
-import           Data.Aeson.TH (defaultOptions, deriveJSON)
-import           Data.Foldable (traverse_)
-import           Data.List (sortOn)
-import           Data.Text.Encoding.Error (strictDecode)
-import           Data.Time.LocalTime (ZonedTime(..))
+import Data.Aeson.TH (defaultOptions, deriveJSON)
+import Data.Foldable (traverse_)
+import Data.List (sortOn)
+import Data.Text.Encoding.Error (strictDecode)
+import Data.Time.LocalTime (ZonedTime(..))
 import qualified FortyTwo
-import           Network.HTTP.Client (HttpException(..), HttpExceptionContent(..))
-import           Network.HTTP.Types (urlEncode)
+import Network.HTTP.Client
+  ( HttpException(..)
+  , HttpExceptionContent(..)
+  , Response(..)
+  )
+import Network.HTTP.Types (urlEncode)
 import qualified Network.Wreq as Wreq
 import qualified Options.Applicative as OA
-import           RIO
+import RIO
 import qualified RIO.Text as T
 import qualified Turtle
 
@@ -215,9 +219,8 @@ createMergeRequest source target = do
       doIt <-
         liftIO $
         FortyTwo.confirmWithDefault
-          ("Create merge request from " ++ T.unpack source ++ " into " ++
-           T.unpack target ++
-           "?")
+          ("Create merge request from " ++
+           T.unpack source ++ " into " ++ T.unpack target ++ "?")
           True
       when doIt $ do
         title <-
@@ -231,10 +234,10 @@ createMergeRequest source target = do
             response <-
               liftIO $
               Wreq.post
-                ("https://" ++ host ++ "/api/v4" ++
-                 mergeRequestEndpointFor project ++
-                 "?private_token=" ++
-                 token)
+                ("https://" ++
+                 host ++
+                 "/api/v4" ++
+                 mergeRequestEndpointFor project ++ "?private_token=" ++ token)
                 (createMrBody (T.pack title) source target)
             return (preview (Wreq.responseBody . AesonLens._JSON) response)
         case result of
@@ -252,10 +255,11 @@ getBranches =
       view Wreq.responseBody <$>
       liftIO
         (Wreq.get
-           ("https://" ++ host ++ "/api/v4" ++ branchesEndpointFor project ++
-            "?private_token=" ++
-            token))
-    let bs = resp ^.. AesonLens.values . AesonLens._JSON
+           ("https://" ++
+            host ++
+            "/api/v4" ++
+            branchesEndpointFor project ++ "?private_token=" ++ token))
+    let bs = toListOf (AesonLens.values . AesonLens._JSON) resp
     return (sortByCommittedDate bs)
 
 sortByCommittedDate :: [Branch] -> [Branch]
@@ -267,9 +271,11 @@ handleHttpException ::
      (MonadIO m, MonadReader env m, HasLogFunc env, HasCallStack)
   => HttpException
   -> m ()
-handleHttpException (HttpExceptionRequest _ (StatusCodeException _ content)) = do
+handleHttpException (HttpExceptionRequest _ (StatusCodeException resp content)) = do
   logError . display @Text $
-    "Oops something went wrong! See below for an error message from gitlab."
+    "Oops something went wrong! Any available information will be shown below."
+  logError . display . T.pack $
+    "Response status was: " ++ show (responseStatus resp)
   traverse_ (logError . display) (xs ++ ys)
   where
     xs =
@@ -278,8 +284,8 @@ handleHttpException (HttpExceptionRequest _ (StatusCodeException _ content)) = d
         content
     ys =
       toListOf
-        (AesonLens._JSON . AesonLens.key @Value "message" . AesonLens.values .
-         AesonLens._String)
+        (AesonLens._JSON .
+         AesonLens.key @Value "message" . AesonLens.values . AesonLens._String)
         content
 handleHttpException (HttpExceptionRequest _ (ConnectionFailure e)) = do
   logError "Oops something went wrong!"

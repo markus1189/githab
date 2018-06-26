@@ -4,6 +4,6 @@ packages:
 extra-deps:
   - fortytwo-1.0.3
   - ansi-terminal-0.7.1.1
-  - text-1.2.2.2
 nix:
   enable: true
+allow-newer: true

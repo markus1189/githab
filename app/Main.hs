@@ -3,6 +3,8 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE PartialTypeSignatures #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE TypeOperators #-}
 
 module Main where
 
@@ -19,6 +21,7 @@ import qualified Data.Aeson.Lens as AesonLens
 import Data.Aeson.TH (defaultOptions, deriveJSON)
 import Data.Foldable (traverse_)
 import Data.List (sortOn)
+import Data.Proxy
 import Data.Text.Encoding.Error (strictDecode)
 import Data.Time.LocalTime (ZonedTime(..))
 import qualified FortyTwo
@@ -38,6 +41,8 @@ import qualified Network.Wreq.Session as WreqS
 import qualified Options.Applicative as OA
 import RIO
 import qualified RIO.Text as T
+import Servant.API
+import qualified Servant.Client as ServantClient
 import qualified Turtle
 
 makePrisms ''HttpException
@@ -148,6 +153,33 @@ makeClassy ''Env
 
 instance HasLogFunc Env where
   logFuncL = envLogFunc
+
+data CreateMergeReq = CreateMergeReq
+  { _createMrSourceBranch :: Text
+  , _createMrTargetBranch :: Text
+  , _createMrTitle :: Text
+  , _createMrRemoveSourceBranch :: Bool
+  } deriving (Show)
+
+$(deriveJSON
+    (defaultOptions
+       { Aeson.fieldLabelModifier =
+           T.unpack . snakify . T.pack . drop (length @[] "_createMr")
+       })
+    'CreateMergeReq)
+
+type PrivateTokenHeader = Header' '[ Strict, Required] "Private-Token" Text
+
+type API
+   = PrivateTokenHeader :> "projects" :> Capture "project-id" Text :> "merge_requests" :> ReqBody '[ JSON] CreateMergeReq :> Post '[ JSON] MergeReq :<|> PrivateTokenHeader :> "projects" :> Capture "project-id" Text :> "repository" :> "branches" :> Get '[ JSON] [Branch]
+
+api :: Proxy API
+api = Proxy
+
+servantMergeReq ::
+     Text -> Text -> CreateMergeReq -> ServantClient.ClientM MergeReq
+servantBranches :: Text -> Text -> ServantClient.ClientM [Branch]
+servantMergeReq :<|> servantBranches = ServantClient.client api
 
 baseUrl :: String
 baseUrl = "https://gitlab.com/api/v4"

@@ -46,6 +46,8 @@ executable githab
                , mtl
                , optparse-applicative
                , rio
+               , servant
+               , servant-client
                , text
                , time
                , transformers

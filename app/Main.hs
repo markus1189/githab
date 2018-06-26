@@ -3,9 +3,9 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE PartialTypeSignatures #-}
+
 module Main where
 
-import           Network.Connection (TLSSettings(..))
 import Cases (snakify)
 import Control.Applicative ((<**>))
 import Control.Exception (throw)
@@ -23,14 +23,15 @@ import Data.Text.Encoding.Error (strictDecode)
 import Data.Time.LocalTime (ZonedTime(..))
 import qualified FortyTwo
 import qualified FortyTwo.Utils as FortyTwo
-import Network.HTTP.Client.TLS (mkManagerSettings)
+import Network.Connection (TLSSettings(..))
 import Network.HTTP.Client
   ( HttpException(..)
   , HttpExceptionContent(..)
-  , Response(..)
   , ManagerSettings
+  , Response(..)
   , defaultManagerSettings
   )
+import Network.HTTP.Client.TLS (mkManagerSettings)
 import Network.HTTP.Types (urlEncode)
 import qualified Network.Wreq as Wreq
 import qualified Network.Wreq.Session as WreqS
@@ -45,7 +46,7 @@ makePrisms ''HttpExceptionContent
 
 data HostExtractionException =
   HostExtractionException Text
-  deriving Show
+  deriving (Show)
 
 instance Exception HostExtractionException
 
@@ -53,6 +54,7 @@ data Options = Options
   { _optionsToken :: String
   , _optionsVerbose :: Bool
   , _optionsNoVerify :: Bool
+  , _optionsIntoMaster :: Bool
   }
 
 options :: OA.Parser Options
@@ -63,7 +65,11 @@ options =
   OA.switch
     (OA.long "verbose" <> OA.short 'v' <> OA.help "Enable verbose logging") <*>
   OA.switch
-    (OA.long "no-verify" <> OA.help "Disable certificate check (on your own risk)")
+    (OA.long "no-verify" <>
+     OA.help "Disable certificate check (on your own risk)") <*>
+  OA.switch
+    (OA.long "into-master" <>
+     OA.help "Use master as the target branch and don't ask")
 
 opts :: OA.ParserInfo Options
 opts =
@@ -83,7 +89,7 @@ data Commit = Commit
   , _commitCommitterName :: Text
   , _commitCommitterEmail :: Text
   , _commitCommittedDate :: ZonedTime
-  } deriving Show
+  } deriving (Show)
 
 makeLenses ''Commit
 
@@ -101,7 +107,7 @@ data Branch = Branch
   , _branchProtected :: Bool
   , _branchDevelopersCanPush :: Bool
   , _branchDevelopersCanMerge :: Bool
-  } deriving Show
+  } deriving (Show)
 
 makeLenses ''Branch
 
@@ -121,7 +127,7 @@ data MergeReq = MergeReq
   , _mrTitle :: Text
   , _mrState :: Text
   , _mrWebUrl :: Text
-  } deriving Show
+  } deriving (Show)
 
 makeLenses ''MergeReq
 
@@ -163,8 +169,13 @@ createMrBody title source target =
 
 main :: IO ()
 main = do
-  Options token isVerbose noVerify <- OA.execParser opts
-  session <- WreqS.newSessionControl Nothing (if noVerify then noVerifyTlsManagerSettings else defaultManagerSettings)
+  Options token isVerbose noVerify intoMaster <- OA.execParser opts
+  session <-
+    WreqS.newSessionControl
+      Nothing
+      (if noVerify
+         then noVerifyTlsManagerSettings
+         else defaultManagerSettings)
   logOptions' <- logOptionsHandle stderr isVerbose
   let logOptions = setLogUseTime True logOptions'
   withLogFunc logOptions $ \lf -> do
@@ -183,11 +194,13 @@ main = do
               (map T.unpack bs)
               (T.unpack curBranch)
           targetBranch <-
-            liftIO $
-            FortyTwo.selectWithDefault
-              "Target branch?"
-              (map T.unpack bs)
-              "master"
+            if intoMaster
+              then return "master"
+              else liftIO $
+                   FortyTwo.selectWithDefault
+                     "Target branch?"
+                     (map T.unpack bs)
+                     "master"
           createMergeRequest (T.pack sourceBranch) (T.pack targetBranch)
           return ()
 
@@ -228,37 +241,33 @@ createMergeRequest source target = do
   if source == target
     then logError "Source and target branches are equal, refusing."
     else do
-      doIt <-
-        liftIO $
-          FortyTwo.confirmWithDefault
-            ("Create merge request from " ++
-             T.unpack source ++ " into " ++ T.unpack target ++ "?")
-            True
-      when doIt $ do
-        title <-
-          liftIO $
-          FortyTwo.inputWithDefault
-            "Title?"
-            ("Merge branch " ++ T.unpack source)
-        result <-
-          try $ do
-            liftIO FortyTwo.flush
-            token <- view envAccessToken
-            response <-
-              liftIO $
-              WreqS.post sess
-                ("https://" ++
-                 host ++
-                 "/api/v4" ++
-                 mergeRequestEndpointFor project ++ "?private_token=" ++ token)
-                (createMrBody (T.pack title) source target)
-            return (preview (Wreq.responseBody . AesonLens._JSON) response)
-        case result of
-          Right (Just mr) -> do
-            logInfo . display $ view mrWebUrl mr
-            logInfo "Created the merge request"
-          Right Nothing -> logError . displayShow $ result
-          Left e -> handleHttpException e
+      title <- titlePrompt (T.unpack source)
+      result <-
+        try $ do
+          liftIO FortyTwo.flush
+          token <- view envAccessToken
+          response <-
+            liftIO $
+            WreqS.post
+              sess
+              ("https://" ++
+               host ++
+               "/api/v4" ++
+               mergeRequestEndpointFor project ++ "?private_token=" ++ token)
+              (createMrBody (T.pack title) source target)
+          return (preview (Wreq.responseBody . AesonLens._JSON) response)
+      case result of
+        Right (Just mr) -> do
+          logInfo . display $ view mrWebUrl mr
+          logInfo "Created the merge request"
+        Right Nothing -> logError . displayShow $ result
+        Left e -> handleHttpException e
+
+titlePrompt :: MonadIO m => String -> m String
+titlePrompt source =
+  liftIO $ FortyTwo.inputWithDefault "Title?" suggested <* FortyTwo.flush
+  where
+    suggested = "Merge branch " ++ source
 
 getBranches ::
      (MonadUnliftIO m, MonadReader env m, HasEnv env)
@@ -271,7 +280,8 @@ getBranches =
     resp <-
       view Wreq.responseBody <$>
       liftIO
-        (WreqS.get sess
+        (WreqS.get
+           sess
            ("https://" ++
             host ++
             "/api/v4" ++
@@ -310,11 +320,12 @@ handleHttpException (HttpExceptionRequest _ (ConnectionFailure e)) = do
 handleHttpException e = throw e
 
 noVerifyTlsSettings :: TLSSettings
-noVerifyTlsSettings = TLSSettingsSimple
-  { settingDisableCertificateValidation = True
-  , settingDisableSession = True
-  , settingUseServerName = False
-  }
+noVerifyTlsSettings =
+  TLSSettingsSimple
+    { settingDisableCertificateValidation = True
+    , settingDisableSession = True
+    , settingUseServerName = False
+    }
 
 noVerifyTlsManagerSettings :: ManagerSettings
 noVerifyTlsManagerSettings = mkManagerSettings noVerifyTlsSettings Nothing

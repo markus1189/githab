@@ -5,22 +5,19 @@
 {-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TypeOperators #-}
-
 module Main where
 
-import Cases (snakify)
 import Control.Applicative ((<**>))
 import Control.Exception (throw)
-import Control.Lens (preview, toListOf)
-import Control.Lens.TH (makeClassy, makeLenses, makePrisms)
+import Control.Lens (_Just, preview, toListOf)
+import Control.Lens.TH (makePrisms)
 import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value)
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Lens as AesonLens
-import Data.Aeson.TH (defaultOptions, deriveJSON)
 import Data.Foldable (traverse_)
-import Data.List (sortOn)
+import Data.List (find, sortOn)
 import Data.Proxy
 import Data.Text.Encoding.Error (strictDecode)
 import Data.Time.LocalTime (ZonedTime(..))
@@ -44,16 +41,11 @@ import qualified RIO.Text as T
 import Servant.API
 import qualified Servant.Client as ServantClient
 import qualified Turtle
+import Githab.Types
 
 makePrisms ''HttpException
 
 makePrisms ''HttpExceptionContent
-
-data HostExtractionException =
-  HostExtractionException Text
-  deriving (Show)
-
-instance Exception HostExtractionException
 
 data Options = Options
   { _optionsToken :: String
@@ -81,97 +73,6 @@ opts =
   OA.info
     (options <**> OA.helper)
     (OA.fullDesc <> OA.progDesc "Create a merge request in gitlab")
-
-data Commit = Commit
-  { _commitId :: Text
-  , _commitShortId :: Text
-  , _commitTitle :: Text
-  , _commitCreatedAt :: ZonedTime
-  , _commitMessage :: Text
-  , _commitAuthorName :: Text
-  , _commitAuthorEmail :: Text
-  , _commitAuthoredDate :: ZonedTime
-  , _commitCommitterName :: Text
-  , _commitCommitterEmail :: Text
-  , _commitCommittedDate :: ZonedTime
-  } deriving (Show)
-
-makeLenses ''Commit
-
-$(deriveJSON
-    (defaultOptions
-       { Aeson.fieldLabelModifier =
-           T.unpack . snakify . T.pack . drop (length @[] "_commit")
-       })
-    'Commit)
-
-data Branch = Branch
-  { _branchName :: Text
-  , _branchCommit :: Commit
-  , _branchMerged :: Bool
-  , _branchProtected :: Bool
-  , _branchDevelopersCanPush :: Bool
-  , _branchDevelopersCanMerge :: Bool
-  } deriving (Show)
-
-makeLenses ''Branch
-
-$(deriveJSON
-    (defaultOptions
-       { Aeson.fieldLabelModifier =
-           T.unpack . snakify . T.pack . drop (length @[] "_branch")
-       })
-    'Branch)
-
-data MergeReq = MergeReq
-  { _mrId :: Int
-  , _mrIid :: Int
-  , _mrTargetBranch :: Text
-  , _mrSourceBranch :: Text
-  , _mrProjectId :: Int
-  , _mrTitle :: Text
-  , _mrState :: Text
-  , _mrWebUrl :: Text
-  } deriving (Show)
-
-makeLenses ''MergeReq
-
-$(deriveJSON
-    (defaultOptions
-       { Aeson.fieldLabelModifier =
-           T.unpack . snakify . T.pack . drop (length @[] "_mr")
-       })
-    'MergeReq)
-
-data Env = Env
-  { _envAccessToken :: String
-  , _envLogFunc :: LogFunc
-  , _envSession :: WreqS.Session
-  }
-
-makeClassy ''Env
-
-instance HasLogFunc Env where
-  logFuncL = envLogFunc
-
-data CreateMergeReq = CreateMergeReq
-  { _createMrSourceBranch :: Text
-  , _createMrTargetBranch :: Text
-  , _createMrTitle :: Text
-  , _createMrRemoveSourceBranch :: Bool
-  } deriving (Show)
-
-$(deriveJSON
-    (defaultOptions
-       { Aeson.fieldLabelModifier =
-           T.unpack . snakify . T.pack . drop (length @[] "_createMr")
-       })
-    'CreateMergeReq)
-
-type PrivateTokenHeader = Header' '[ Strict, Required] "Private-Token" Text
-
-type API
-   = PrivateTokenHeader :> "projects" :> Capture "project-id" Text :> "merge_requests" :> ReqBody '[ JSON] CreateMergeReq :> Post '[ JSON] MergeReq :<|> PrivateTokenHeader :> "projects" :> Capture "project-id" Text :> "repository" :> "branches" :> Get '[ JSON] [Branch]
 
 api :: Proxy API
 api = Proxy
@@ -214,27 +115,37 @@ main = do
     let app = Env token lf session
     runRIO app $ do
       when noVerify $ logDebug "Certificate checking is disabled!"
-      eitherBranches <- fmap (toListOf (traverse . branchName)) <$> getBranches
+      eitherBranches <- getBranches
       case eitherBranches of
         Left e -> handleHttpException e
         Right bs -> do
           curBranch <- getCurrentBranch
+          let bs' = toListOf (traverse . branchName) bs
           sourceBranch <-
-            liftIO $
-            FortyTwo.selectWithDefault
-              "Source branch?"
-              (map T.unpack bs)
-              (T.unpack curBranch)
-          targetBranch <-
-            if intoMaster
-              then return "master"
-              else liftIO $
+            if curBranch `elem` bs'
+              then liftIO $
                    FortyTwo.selectWithDefault
-                     "Target branch?"
-                     (map T.unpack bs)
-                     "master"
-          createMergeRequest (T.pack sourceBranch) (T.pack targetBranch)
-          return ()
+                     "Source branch?"
+                     (map T.unpack bs')
+                     (T.unpack curBranch)
+              else liftIO $ FortyTwo.select "Source branch?" (map T.unpack bs')
+          liftIO FortyTwo.flush
+          if not (null sourceBranch)
+            then do
+              targetBranch <-
+                if intoMaster
+                  then return "master"
+                  else liftIO $
+                       FortyTwo.selectWithDefault
+                         "Target branch?"
+                         (map T.unpack bs')
+                         "master"
+              title <- titlePrompt sourceBranch bs
+              createMergeRequest
+                (T.pack title)
+                (T.pack sourceBranch)
+                (T.pack targetBranch)
+            else logError "No source branch given!"
 
 shellCmd :: MonadIO m => Text -> m Text
 shellCmd c = Turtle.lineToText <$> Turtle.single (Turtle.inshell c Turtle.empty)
@@ -266,14 +177,14 @@ createMergeRequest ::
      )
   => Text
   -> Text
+  -> Text
   -> m ()
-createMergeRequest source target = do
+createMergeRequest title source target = do
   sess <- view envSession
   (T.unpack -> host, T.unpack -> project) <- getHostAndProject
   if source == target
     then logError "Source and target branches are equal, refusing."
     else do
-      title <- titlePrompt (T.unpack source)
       result <-
         try $ do
           liftIO FortyTwo.flush
@@ -286,7 +197,7 @@ createMergeRequest source target = do
                host ++
                "/api/v4" ++
                mergeRequestEndpointFor project ++ "?private_token=" ++ token)
-              (createMrBody (T.pack title) source target)
+              (createMrBody title source target)
           return (preview (Wreq.responseBody . AesonLens._JSON) response)
       case result of
         Right (Just mr) -> do
@@ -295,11 +206,20 @@ createMergeRequest source target = do
         Right Nothing -> logError . displayShow $ result
         Left e -> handleHttpException e
 
-titlePrompt :: MonadIO m => String -> m String
-titlePrompt source =
-  liftIO $ FortyTwo.inputWithDefault "Title?" suggested <* FortyTwo.flush
+titlePrompt :: MonadIO m => String -> [Branch] -> m String
+titlePrompt source bs =
+  liftIO $
+  FortyTwo.selectWithDefault
+    "Title?"
+    (suggested : maybeToList fromCommit)
+    defaultTitle <*
+  FortyTwo.flush
   where
+    defaultTitle = fromMaybe ("Merge branch " ++ source) fromCommit
     suggested = "Merge branch " ++ source
+    fromCommit =
+      preview (_Just . branchCommit . commitTitle . to T.unpack) $
+      find (\b -> view branchName b == T.pack source) bs
 
 getBranches ::
      (MonadUnliftIO m, MonadReader env m, HasEnv env)

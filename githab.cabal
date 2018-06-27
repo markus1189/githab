@@ -16,8 +16,29 @@ source-repository head
   type: git
   location: https://github.com/markus1189/githab
 
+library
+  default-language: Haskell2010
+  exposed-modules: Githab.Types
+  default-extensions: NoImplicitPrelude
+  hs-source-dirs: src
+  ghc-options: -Wall
+               -Wcompat
+               -Wincomplete-record-updates
+               -Wincomplete-uni-patterns
+               -Wredundant-constraints
+               -threaded -rtsopts -with-rtsopts=-N
+  build-depends: base >=4.7 && <5
+               , rio
+               , servant
+               , wreq
+               , time
+               , aeson
+               , lens
+               , cases
+
 executable githab
   default-extensions: NoImplicitPrelude
+  default-language: Haskell2010
   main-is: Main.hs
   other-modules:
       Paths_githab
@@ -38,6 +59,7 @@ executable githab
                , containers
                , formatting
                , fortytwo
+               , githab
                , http-client
                , http-client-tls
                , http-types
@@ -53,5 +75,3 @@ executable githab
                , transformers
                , turtle
                , wreq
-
-  default-language: Haskell2010

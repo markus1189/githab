@@ -1,72 +1,72 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TypeOperators #-}
-module Main where
+
+module Main
+  ( main
+  ) where
 
 import Control.Applicative ((<**>))
-import Control.Exception (throw)
 import Control.Lens (_Just, preview, toListOf)
-import Control.Lens.TH (makePrisms)
 import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (Value)
-import qualified Data.Aeson as Aeson
-import qualified Data.Aeson.Lens as AesonLens
-import Data.Foldable (traverse_)
 import Data.List (find, sortOn)
-import Data.Proxy
-import Data.Text.Encoding.Error (strictDecode)
 import Data.Time.LocalTime (ZonedTime(..))
 import qualified FortyTwo
 import qualified FortyTwo.Utils as FortyTwo
+import qualified Githab.Api as Api
+import Githab.Types
 import Network.Connection (TLSSettings(..))
-import Network.HTTP.Client
-  ( HttpException(..)
-  , HttpExceptionContent(..)
-  , ManagerSettings
-  , Response(..)
-  , defaultManagerSettings
-  )
-import Network.HTTP.Client.TLS (mkManagerSettings)
-import Network.HTTP.Types (urlEncode)
-import qualified Network.Wreq as Wreq
-import qualified Network.Wreq.Session as WreqS
+import Network.HTTP.Client (ManagerSettings, newManager)
+import Network.HTTP.Client.TLS (mkManagerSettings, tlsManagerSettings)
 import qualified Options.Applicative as OA
 import RIO
 import qualified RIO.Text as T
-import Servant.API
 import qualified Servant.Client as ServantClient
+import System.Exit (exitFailure)
 import qualified Turtle
-import Githab.Types
-
-makePrisms ''HttpException
-
-makePrisms ''HttpExceptionContent
 
 data Options = Options
-  { _optionsToken :: String
+  { _optionsToken :: Text
   , _optionsVerbose :: Bool
   , _optionsNoVerify :: Bool
-  , _optionsIntoMaster :: Bool
+  , _optionsTarget :: Maybe BranchName
+  , _optionsAutomatic :: Bool
+  , _optionsTitle :: Maybe Text
+  , _optionsAutoTitle :: Bool
   }
 
 options :: OA.Parser Options
 options =
   Options <$>
-  OA.strOption
+  OA.option
+    OA.str
     (OA.long "token" <> OA.metavar "TOKEN" <> OA.help "Access token for gitlab") <*>
   OA.switch
     (OA.long "verbose" <> OA.short 'v' <> OA.help "Enable verbose logging") <*>
   OA.switch
     (OA.long "no-verify" <>
      OA.help "Disable certificate check (on your own risk)") <*>
+  optional
+    (OA.option
+       OA.str
+       (OA.long "target" <> OA.metavar "TARGET_BRANCH" <>
+        OA.help
+          "Use TARGET_BRANCH as the target branch for the merge request and don't ask")) <*>
   OA.switch
-    (OA.long "into-master" <>
-     OA.help "Use master as the target branch and don't ask")
+    (OA.long "from-newest" <>
+     OA.help "Pick the most recently commited branch as source and don't ask") <*>
+  optional
+    (OA.option
+       OA.str
+       (OA.long "title" <> OA.metavar "TITLE" <>
+        OA.help "Use given title for the merge request and don't ask ")) <*>
+  OA.switch
+    (OA.long "auto-title" <>
+     OA.help "Use the last commit as the merge request title and don't ask")
 
 opts :: OA.ParserInfo Options
 opts =
@@ -74,92 +74,90 @@ opts =
     (options <**> OA.helper)
     (OA.fullDesc <> OA.progDesc "Create a merge request in gitlab")
 
-api :: Proxy API
-api = Proxy
-
-servantMergeReq ::
-     Text -> Text -> CreateMergeReq -> ServantClient.ClientM MergeReq
-servantBranches :: Text -> Text -> ServantClient.ClientM [Branch]
-servantMergeReq :<|> servantBranches = ServantClient.client api
-
-baseUrl :: String
-baseUrl = "https://gitlab.com/api/v4"
-
-mergeRequestEndpointFor :: String -> String
-mergeRequestEndpointFor ident = "/projects/" ++ ident ++ "/merge_requests"
-
-branchesEndpointFor :: String -> String
-branchesEndpointFor ident = "/projects/" ++ ident ++ "/repository/branches"
-
-createMrBody :: Text -> Text -> Text -> Value
-createMrBody title source target =
-  Aeson.object
-    [ ("source_branch", Aeson.String source)
-    , ("target_branch", Aeson.String target)
-    , ("title", Aeson.String title)
-    , ("remove_source_branch", Aeson.Bool True)
-    ]
-
 main :: IO ()
 main = do
-  Options token isVerbose noVerify intoMaster <- OA.execParser opts
-  session <-
-    WreqS.newSessionControl
-      Nothing
+  Options token isVerbose noVerify optTarget fromNewest maybeTitle autoTitle <-
+    OA.execParser opts
+  manager <-
+    newManager
       (if noVerify
          then noVerifyTlsManagerSettings
-         else defaultManagerSettings)
+         else tlsManagerSettings)
   logOptions' <- logOptionsHandle stderr isVerbose
   let logOptions = setLogUseTime True logOptions'
   withLogFunc logOptions $ \lf -> do
-    let app = Env token lf session
+    let app = Env (PrivateToken token) lf manager
     runRIO app $ do
       when noVerify $ logDebug "Certificate checking is disabled!"
-      eitherBranches <- getBranches
+      eitherBranches <- fmap sortByCommittedDate <$> runClientM Api.listBranches
       case eitherBranches of
-        Left e -> handleHttpException e
+        Left e -> dieShow e
         Right bs -> do
           curBranch <- getCurrentBranch
           let bs' = toListOf (traverse . branchName) bs
           sourceBranch <-
-            if curBranch `elem` bs'
-              then liftIO $
-                   FortyTwo.selectWithDefault
-                     "Source branch?"
-                     (map T.unpack bs')
-                     (T.unpack curBranch)
-              else liftIO $ FortyTwo.select "Source branch?" (map T.unpack bs')
-          liftIO FortyTwo.flush
-          if not (null sourceBranch)
+            if fromNewest
+              then case bs' of
+                     [] -> dieText "No branch found..."
+                     b:_ -> return b
+              else if curBranch `elem` bs'
+                     then fmap fromString . liftIO $
+                          FortyTwo.selectWithDefault
+                            "Source branch?"
+                            (map branchNameToString bs')
+                            (branchNameToString curBranch) <*
+                          FortyTwo.flush
+                     else fmap fromString . liftIO $
+                          FortyTwo.select
+                            "Source branch?"
+                            (map branchNameToString bs') <*
+                          FortyTwo.flush
+          if not (null (branchNameToString sourceBranch))
             then do
               targetBranch <-
-                if intoMaster
-                  then return "master"
-                  else liftIO $
-                       FortyTwo.selectWithDefault
-                         "Target branch?"
-                         (map T.unpack bs')
-                         "master"
-              title <- titlePrompt sourceBranch bs
-              createMergeRequest
-                (T.pack title)
-                (T.pack sourceBranch)
-                (T.pack targetBranch)
+                case optTarget of
+                  Just tgt -> return tgt
+                  Nothing ->
+                    fmap fromString . liftIO $
+                    FortyTwo.selectWithDefault
+                      "Target branch?"
+                      (map branchNameToString bs')
+                      "master" <*
+                    FortyTwo.flush
+              when (sourceBranch == targetBranch) $
+                dieText "Source and target branch must not be equal!"
+              logInfo . display . T.pack $
+                "Will create: " ++
+                branchNameToString sourceBranch <> " -> " <>
+                branchNameToString targetBranch
+              title <-
+                case maybeTitle of
+                  Nothing -> do
+                    titlePrompt sourceBranch bs autoTitle
+                  Just t -> return t
+              result <-
+                runClientM
+                  (Api.createMergeRequest
+                     (mkCreateMergeReq sourceBranch targetBranch title True))
+              case result of
+                Left e -> dieShow e
+                Right mr -> do
+                  logInfo . display $ ("...done!" :: Text)
+                  logInfo . display $ view mrWebUrl mr
             else logError "No source branch given!"
 
 shellCmd :: MonadIO m => Text -> m Text
 shellCmd c = Turtle.lineToText <$> Turtle.single (Turtle.inshell c Turtle.empty)
 
-getCurrentBranch :: MonadIO m => m Text
-getCurrentBranch = liftIO $ shellCmd "git rev-parse --abbrev-ref HEAD"
+getCurrentBranch :: MonadIO m => m BranchName
+getCurrentBranch =
+  liftIO . fmap BranchName $ shellCmd "git rev-parse --abbrev-ref HEAD"
 
-getHostAndProject :: MonadIO m => m (Text, Text)
+getHostAndProject :: MonadIO m => m (Text, ProjectId)
 getHostAndProject = do
   fullUrl <- shellCmd "git remote get-url origin"
   (host, project) <- splitRemoteOrFail fullUrl
-  return
-    ( host
-    , T.decodeUtf8With strictDecode . urlEncode True . encodeUtf8 $ project)
+  return (host, ProjectId project)
 
 splitRemoteOrFail :: MonadIO m => Text -> m (Text, Text)
 splitRemoteOrFail url =
@@ -167,109 +165,35 @@ splitRemoteOrFail url =
     [_, host, projectWithSuffix] -> return (host, T.dropEnd 4 projectWithSuffix)
     _ -> throwIO (HostExtractionException url)
 
-createMergeRequest ::
-     ( MonadIO m
-     , MonadReader env m
-     , HasLogFunc env
-     , MonadUnliftIO m
-     , HasEnv env
-     , HasCallStack
-     )
-  => Text
-  -> Text
-  -> Text
-  -> m ()
-createMergeRequest title source target = do
-  sess <- view envSession
-  (T.unpack -> host, T.unpack -> project) <- getHostAndProject
-  if source == target
-    then logError "Source and target branches are equal, refusing."
-    else do
-      result <-
-        try $ do
-          liftIO FortyTwo.flush
-          token <- view envAccessToken
-          response <-
-            liftIO $
-            WreqS.post
-              sess
-              ("https://" ++
-               host ++
-               "/api/v4" ++
-               mergeRequestEndpointFor project ++ "?private_token=" ++ token)
-              (createMrBody title source target)
-          return (preview (Wreq.responseBody . AesonLens._JSON) response)
-      case result of
-        Right (Just mr) -> do
-          logInfo . display $ view mrWebUrl mr
-          logInfo "Created the merge request"
-        Right Nothing -> logError . displayShow $ result
-        Left e -> handleHttpException e
-
-titlePrompt :: MonadIO m => String -> [Branch] -> m String
-titlePrompt source bs =
-  liftIO $
-  FortyTwo.selectWithDefault
-    "Title?"
-    (suggested : maybeToList fromCommit)
-    defaultTitle <*
-  FortyTwo.flush
+titlePrompt ::
+     (MonadIO m, MonadReader env m, HasLogFunc env)
+  => BranchName
+  -> [Branch]
+  -> Bool
+  -> m Text
+titlePrompt source bs autoTitleEnabled =
+  if autoTitleEnabled
+    then case fromCommit of
+           Nothing -> dieText "Could not determine title automatically"
+           Just t -> return (T.pack t)
+    else liftIO $
+         T.pack <$>
+         FortyTwo.selectWithDefault
+           "Title?"
+           (suggested : maybeToList fromCommit)
+           defaultTitle <*
+         FortyTwo.flush
   where
-    defaultTitle = fromMaybe ("Merge branch " ++ source) fromCommit
-    suggested = "Merge branch " ++ source
+    defaultTitle = fromMaybe suggested fromCommit
+    suggested = "Merge branch " ++ branchNameToString source
     fromCommit =
       preview (_Just . branchCommit . commitTitle . to T.unpack) $
-      find (\b -> view branchName b == T.pack source) bs
-
-getBranches ::
-     (MonadUnliftIO m, MonadReader env m, HasEnv env)
-  => m (Either HttpException [Branch])
-getBranches =
-  try $ do
-    sess <- view envSession
-    token <- view envAccessToken
-    (T.unpack -> host, T.unpack -> project) <- getHostAndProject
-    resp <-
-      view Wreq.responseBody <$>
-      liftIO
-        (WreqS.get
-           sess
-           ("https://" ++
-            host ++
-            "/api/v4" ++
-            branchesEndpointFor project ++ "?private_token=" ++ token))
-    let bs = toListOf (AesonLens.values . AesonLens._JSON) resp
-    return (sortByCommittedDate bs)
+      find (\b -> view branchName b == source) bs
 
 sortByCommittedDate :: [Branch] -> [Branch]
 sortByCommittedDate =
   reverse .
   sortOn (view (branchCommit . commitCommittedDate . to zonedTimeToLocalTime))
-
-handleHttpException ::
-     (MonadIO m, MonadReader env m, HasLogFunc env, HasCallStack)
-  => HttpException
-  -> m ()
-handleHttpException (HttpExceptionRequest _ (StatusCodeException resp content)) = do
-  logError . display @Text $
-    "Oops something went wrong! Any available information will be shown below."
-  logError . display . T.pack $
-    "Response status was: " ++ show (responseStatus resp)
-  traverse_ (logError . display) (xs ++ ys)
-  where
-    xs =
-      toListOf
-        (AesonLens._JSON . AesonLens.key @Value "message" . AesonLens._String)
-        content
-    ys =
-      toListOf
-        (AesonLens._JSON .
-         AesonLens.key @Value "message" . AesonLens.values . AesonLens._String)
-        content
-handleHttpException (HttpExceptionRequest _ (ConnectionFailure e)) = do
-  logError "Oops something went wrong!"
-  logError . display $ e
-handleHttpException e = throw e
 
 noVerifyTlsSettings :: TLSSettings
 noVerifyTlsSettings =
@@ -281,3 +205,30 @@ noVerifyTlsSettings =
 
 noVerifyTlsManagerSettings :: ManagerSettings
 noVerifyTlsManagerSettings = mkManagerSettings noVerifyTlsSettings Nothing
+
+runClientM ::
+     (HasEnv env, MonadIO m, MonadReader env m)
+  => (PrivateToken -> ProjectId -> ServantClient.ClientM a)
+  -> m (Either ServantClient.ServantError a)
+runClientM action = do
+  manager <- view envManager
+  token <- view envAccessToken
+  (T.unpack -> host, project) <- getHostAndProject
+  liftIO $
+    ServantClient.runClientM
+      (action token project)
+      (ServantClient.mkClientEnv
+         manager
+         (ServantClient.BaseUrl ServantClient.Https host 443 "api/v4"))
+
+dieShow :: (HasLogFunc env, MonadReader env m, MonadIO m, Show a) => a -> m void
+dieShow = die . T.pack . show
+
+dieText :: (HasLogFunc env, MonadReader env m, MonadIO m) => Text -> m void
+dieText = die
+
+die :: (HasLogFunc env, MonadReader env m, MonadIO m, Display a) => a -> m void
+die message = do
+  logError . display @Text $ "...error!"
+  logError . display $ message
+  liftIO exitFailure

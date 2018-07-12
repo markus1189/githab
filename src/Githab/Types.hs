@@ -1,27 +1,84 @@
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE PartialTypeSignatures #-}
+{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE TypeOperators #-}
-{-# LANGUAGE ViewPatterns #-}
-module Githab.Types where
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PartialTypeSignatures #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+module Githab.Types ( PrivateToken (..)
+                    , ProjectId (..)
+
+                    , BranchName (..)
+                    , branchNameToString
+
+                    , HostExtractionException(..)
+
+                    , Commit
+                    , commitId
+                    , commitShortId
+                    , commitTitle
+                    , commitCreatedAt
+                    , commitMessage
+                    , commitAuthorName
+                    , commitAuthorEmail
+                    , commitAuthoredDate
+                    , commitCommitterName
+                    , commitCommitterEmail
+                    , commitCommittedDate
+
+                    , Branch
+                    , branchName
+                    , branchCommit
+                    , branchMerged
+                    , branchProtected
+                    , branchDevelopersCanPush
+                    , branchDevelopersCanMerge
+
+                    , MergeReq
+                    , mrId
+                    , mrIid
+                    , mrTargetBranch
+                    , mrSourceBranch
+                    , mrProjectId
+                    , mrTitle
+                    , mrState
+                    , mrWebUrl
+
+                    , Env (..)
+                    , HasEnv (..)
+
+                    , CreateMergeReq
+                    , mkCreateMergeReq
+                    , createMrSourceBranch
+                    , createMrTargetBranch
+                    , createMrTitle
+                    , createMrRemoveSourceBranch
+                    ) where
 
 import Cases (snakify)
 import Control.Lens.TH (makeClassy, makeLenses)
 import qualified Data.Aeson as Aeson
 import Data.Aeson.TH (defaultOptions, deriveJSON)
 import Data.Time.LocalTime (ZonedTime(..))
-import qualified Network.Wreq.Session as WreqS
 import RIO
 import qualified RIO.Text as T
-import Servant.API
+import Servant.API (ToHttpApiData)
+import Network.HTTP.Client (Manager)
 
 newtype HostExtractionException =
   HostExtractionException Text
   deriving (Show)
 
 instance Exception HostExtractionException
+
+newtype PrivateToken = PrivateToken Text deriving (Show, Aeson.ToJSON, Aeson.FromJSON, ToHttpApiData, IsString)
+
+newtype BranchName = BranchName Text deriving (Show, Eq, IsString, Aeson.FromJSON, Aeson.ToJSON)
+branchNameToString :: BranchName -> String
+branchNameToString (BranchName n) = T.unpack n
+
+newtype ProjectId = ProjectId Text deriving (ToHttpApiData, IsString)
 
 data Commit = Commit
   { _commitId :: Text
@@ -47,7 +104,7 @@ $(deriveJSON
     'Commit)
 
 data Branch = Branch
-  { _branchName :: Text
+  { _branchName :: BranchName
   , _branchCommit :: Commit
   , _branchMerged :: Bool
   , _branchProtected :: Bool
@@ -85,9 +142,9 @@ $(deriveJSON
     'MergeReq)
 
 data Env = Env
-  { _envAccessToken :: String
+  { _envAccessToken :: PrivateToken
   , _envLogFunc :: LogFunc
-  , _envSession :: WreqS.Session
+  , _envManager :: Manager
   }
 
 makeClassy ''Env
@@ -96,11 +153,16 @@ instance HasLogFunc Env where
   logFuncL = envLogFunc
 
 data CreateMergeReq = CreateMergeReq
-  { _createMrSourceBranch :: Text
-  , _createMrTargetBranch :: Text
+  { _createMrSourceBranch :: BranchName
+  , _createMrTargetBranch :: BranchName
   , _createMrTitle :: Text
   , _createMrRemoveSourceBranch :: Bool
   } deriving (Show)
+
+mkCreateMergeReq :: BranchName -> BranchName -> Text -> Bool -> CreateMergeReq
+mkCreateMergeReq = CreateMergeReq
+
+makeLenses ''CreateMergeReq
 
 $(deriveJSON
     (defaultOptions
@@ -108,8 +170,3 @@ $(deriveJSON
            T.unpack . snakify . T.pack . drop (length @[] "_createMr")
        })
     'CreateMergeReq)
-
-type PrivateTokenHeader = Header' '[ Strict, Required] "Private-Token" Text
-
-type API
-   = PrivateTokenHeader :> "projects" :> Capture "project-id" Text :> "merge_requests" :> ReqBody '[ JSON] CreateMergeReq :> Post '[ JSON] MergeReq :<|> PrivateTokenHeader :> "projects" :> Capture "project-id" Text :> "repository" :> "branches" :> Get '[ JSON] [Branch]

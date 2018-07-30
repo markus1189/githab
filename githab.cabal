@@ -74,6 +74,7 @@ executable githab
                , rio
                , servant
                , servant-client
+               , slack-web
                , text
                , time
                , transformers

@@ -9,25 +9,32 @@ module Main
   ( main
   ) where
 
-import Control.Applicative ((<**>))
-import Control.Lens (_Just, preview, toListOf)
-import Control.Monad (when)
-import Control.Monad.IO.Class (liftIO)
-import Data.List (find, sortOn)
-import Data.Time.LocalTime (ZonedTime(..))
+import           Control.Applicative ((<**>))
+import           Control.Lens (_Just, preview, toListOf)
+import           Control.Monad (when)
+import           Control.Monad.IO.Class (liftIO)
+import           Data.List (find, sortOn)
+import           Data.Time.LocalTime (ZonedTime(..))
 import qualified FortyTwo
 import qualified FortyTwo.Utils as FortyTwo
 import qualified Githab.Api as Api
-import Githab.Types
-import Network.Connection (TLSSettings(..))
-import Network.HTTP.Client (ManagerSettings, newManager)
-import Network.HTTP.Client.TLS (mkManagerSettings, tlsManagerSettings)
+import           Githab.Types
+import           Network.Connection (TLSSettings(..))
+import           Network.HTTP.Client (ManagerSettings, newManager)
+import           Network.HTTP.Client.TLS (mkManagerSettings, tlsManagerSettings)
 import qualified Options.Applicative as OA
-import RIO
+import           RIO
 import qualified RIO.Text as T
 import qualified Servant.Client as ServantClient
-import System.Exit (exitFailure)
+import           System.Exit (exitFailure)
 import qualified Turtle
+import qualified Web.Slack as Slack
+import qualified Web.Slack.Chat as Chat
+
+data ToSlack = ToSlack
+  { _toSlackToken :: Text
+  , _toSlackChannel :: Text
+  }
 
 data Options = Options
   { _optionsToken :: Text
@@ -37,6 +44,7 @@ data Options = Options
   , _optionsAutomatic :: Bool
   , _optionsTitle :: Maybe Text
   , _optionsAutoTitle :: Bool
+  , _optionsToSlack :: Maybe ToSlack
   }
 
 options :: OA.Parser Options
@@ -44,7 +52,7 @@ options =
   Options <$>
   OA.option
     OA.str
-    (OA.long "token" <> OA.metavar "TOKEN" <> OA.help "Access token for gitlab") <*>
+    (OA.long "gitlab-token" <> OA.metavar "GITLAB_TOKEN" <> OA.help "Access token for gitlab") <*>
   OA.switch
     (OA.long "verbose" <> OA.short 'v' <> OA.help "Enable verbose logging") <*>
   OA.switch
@@ -66,7 +74,16 @@ options =
         OA.help "Use given title for the merge request and don't ask ")) <*>
   OA.switch
     (OA.long "auto-title" <>
-     OA.help "Use the last commit as the merge request title and don't ask")
+     OA.help "Use the last commit as the merge request title and don't ask") <*>
+  (optional $ ToSlack <$>
+     OA.option
+        OA.str
+        (OA.long "slack-token" <> OA.metavar "SLACK_TOKEN" <>
+         OA.help "Use the given slack token to post to slack") <*>
+     OA.option
+        OA.str
+        (OA.long "slack-channel" <> OA.metavar "SLACK_CHANNEL" <>
+         OA.help "Post to this channel"))
 
 opts :: OA.ParserInfo Options
 opts =
@@ -76,7 +93,7 @@ opts =
 
 main :: IO ()
 main = do
-  Options token isVerbose noVerify optTarget fromNewest maybeTitle autoTitle <-
+  Options token isVerbose noVerify optTarget fromNewest maybeTitle autoTitle postToSlack <-
     OA.execParser opts
   manager <-
     newManager
@@ -132,8 +149,7 @@ main = do
                 branchNameToString targetBranch
               title <-
                 case maybeTitle of
-                  Nothing -> do
-                    titlePrompt sourceBranch bs autoTitle
+                  Nothing -> titlePrompt sourceBranch bs autoTitle
                   Just t -> return t
               result <-
                 runClientM
@@ -144,6 +160,10 @@ main = do
                 Right mr -> do
                   logInfo . display $ ("...done!" :: Text)
                   logInfo . display $ view mrWebUrl mr
+                  for_ postToSlack $ \(ToSlack slackToken slackChannel) -> do
+                    logInfo . display $ "Posting to channel " <> slackChannel
+                    slackConfig <- liftIO $ Slack.mkSlackConfig slackToken
+                    flip runReaderT slackConfig (Slack.chatPostMessage (Chat.mkPostMsgReq slackChannel (view mrWebUrl mr)) )
             else logError "No source branch given!"
 
 shellCmd :: MonadIO m => Text -> m Text
